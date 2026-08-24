@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: compile
+        run: python -m py_compile server.py ingest.py common.py tools/gen_sample_corpus.py tests/test_local_rag_mcp.py
+      - name: sample corpus is in sync with its generator
+        run: |
+          python tools/gen_sample_corpus.py
+          git diff --exit-code -- sample-corpus
+      - name: tests (embedder stubbed — no Ollama in CI; real chromadb + mcp installed)
+        run: |
+          pip install -r requirements.txt pytest
+          python -m pytest -q

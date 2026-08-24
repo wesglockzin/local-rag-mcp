@@ -1,0 +1,309 @@
+"""Tests run WITHOUT Ollama and WITHOUT a real Chroma store where possible:
+the embedder is stubbed and the collection is a fake that records calls.
+What's under test is the contracts — validation, the lifecycle pre-filter,
+get_file's corpus-only + symlink hardening, embed-then-swap ingest ordering,
+and the chunker. One optional test uses real chromadb if installed."""
+import os
+import sys
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import common  # noqa: E402
+import ingest  # noqa: E402
+import server  # noqa: E402
+
+
+class FakeCollection:
+    def __init__(self, metadatas=None, documents=None):
+        self.metadatas = metadatas or []
+        self.documents = documents or []
+        self.calls = []
+
+    def count(self):
+        return len(self.metadatas)
+
+    def query(self, **kw):
+        self.calls.append(("query", kw))
+        n = kw.get("n_results", 4)
+        return {"documents": [self.documents[:n]],
+                "metadatas": [self.metadatas[:n]],
+                "distances": [[0.2] * min(n, len(self.metadatas))]}
+
+    def get(self, **kw):
+        self.calls.append(("get", kw))
+        where = kw.get("where")
+        if where and "path" in where:
+            keep = [(m, d) for m, d in zip(
+                self.metadatas, self.documents or [None] * len(self.metadatas))
+                if m.get("path") == where["path"]]
+            return {"ids": [f"{m.get('path')}::{m.get('chunk', 0)}" for m, _ in keep],
+                    "metadatas": [m for m, _ in keep],
+                    "documents": [d for _, d in keep]}
+        return {"ids": [f"{m.get('path')}::{m.get('chunk', 0)}" for m in self.metadatas],
+                "metadatas": self.metadatas, "documents": self.documents}
+
+    def delete(self, **kw):
+        self.calls.append(("delete", kw))
+
+    def add(self, **kw):
+        self.calls.append(("add", kw))
+
+    def upsert(self, **kw):
+        self.calls.append(("upsert", kw))
+
+
+@pytest.fixture(autouse=True)
+def reset_collection(monkeypatch):
+    server._collection = None
+    yield
+    server._collection = None
+
+
+# --- do_search --------------------------------------------------------------
+
+def test_search_rejects_short_query():
+    assert "error" in server.do_search("ab")
+
+
+def test_search_rejects_bad_k():
+    assert "error" in server.do_search("valid query", k="not-a-number")
+
+
+def test_search_clamps_k(monkeypatch):
+    fake = FakeCollection(metadatas=[{"path": f"/p{i}", "lifecycle": "current"}
+                                     for i in range(30)],
+                          documents=[f"doc {i}" for i in range(30)])
+    monkeypatch.setattr(server, "get_collection", lambda: fake)
+    monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: [1.0, 0.0])
+    server.do_search("valid query", k=999)
+    _, kw = fake.calls[-1]
+    assert kw["n_results"] <= 20
+
+
+def test_search_fails_soft_when_embedder_down(monkeypatch):
+    monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: None)
+    out = server.do_search("valid query")
+    assert "error" in out and "Ollama" in out["error"]
+
+
+def test_search_passes_lifecycle_prefilter(monkeypatch):
+    fake = FakeCollection(metadatas=[{"path": "/p", "lifecycle": "current"}],
+                          documents=["doc"])
+    monkeypatch.setattr(server, "get_collection", lambda: fake)
+    monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: [1.0, 0.0])
+    out = server.do_search("valid query")
+    _, kw = fake.calls[-1]
+    assert kw["where"] == {"lifecycle": {"$ne": "superseded"}}
+    assert out["results"][0]["score"] == pytest.approx(0.8)  # 1 - 0.2
+
+
+def test_search_reports_missing_store(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "STORE_DIR", str(tmp_path / "nope"))
+    monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: [1.0])
+    out = server.do_search("valid query")
+    assert "error" in out and "ingest" in out["error"]
+
+
+# --- do_get_file ------------------------------------------------------------
+
+def test_get_file_refuses_non_corpus_path(monkeypatch):
+    fake = FakeCollection(metadatas=[{"path": "/corpus/a.md",
+                                      "real_path": "/corpus/a.md"}])
+    monkeypatch.setattr(server, "get_collection", lambda: fake)
+    out = server.do_get_file("/etc/hosts")
+    assert "error" in out and "hint" in out
+
+
+def test_get_file_refuses_swapped_symlink(tmp_path, monkeypatch):
+    real = tmp_path / "a.md"
+    real.write_text("original", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    fake = FakeCollection(metadatas=[{"path": str(real), "real_path": str(real)}])
+    monkeypatch.setattr(server, "get_collection", lambda: fake)
+    real.unlink()
+    os.symlink(outside, real)  # same path, now resolves elsewhere
+    out = server.do_get_file(str(real))
+    assert "error" in out and "resolves elsewhere" in out["error"]
+
+
+def test_get_file_reads_valid_indexed_file(tmp_path, monkeypatch):
+    p = tmp_path / "a.md"
+    p.write_text("hello corpus", encoding="utf-8")
+    fake = FakeCollection(metadatas=[{"path": str(p),
+                                      "real_path": os.path.realpath(str(p))}])
+    monkeypatch.setattr(server, "get_collection", lambda: fake)
+    out = server.do_get_file(str(p))
+    assert out["text"] == "hello corpus"
+
+
+def test_get_file_serves_index_text_when_file_absent(tmp_path, monkeypatch):
+    gone = str(tmp_path / "gone.md")
+    fake = FakeCollection(
+        metadatas=[{"path": gone, "real_path": gone, "chunk": 1},
+                   {"path": gone, "real_path": gone, "chunk": 0}],
+        documents=["second", "first"])
+    monkeypatch.setattr(server, "get_collection", lambda: fake)
+    out = server.do_get_file(gone)
+    assert out["source"].startswith("index")
+    assert out["text"] == "first\n\nsecond"  # chunk order restored
+
+
+# --- read-only contract -----------------------------------------------------
+
+def test_server_never_creates_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "STORE_DIR", str(tmp_path / "absent"))
+    with pytest.raises(FileNotFoundError):
+        server.get_collection()
+    assert not (tmp_path / "absent").exists()  # and it did NOT create it
+
+
+def test_server_refuses_empty_store_dir(tmp_path, monkeypatch):
+    # An existing-but-empty directory must ALSO be refused: PersistentClient
+    # would initialize database files there, making a read-only server a writer.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(server, "STORE_DIR", str(empty))
+    with pytest.raises(FileNotFoundError):
+        server.get_collection()
+    assert list(empty.iterdir()) == []  # still empty — nothing initialized
+
+
+# --- ingest contracts -------------------------------------------------------
+
+def _setup_corpus(tmp_path, monkeypatch, files):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, body in files.items():
+        (corpus / name).write_text(body, encoding="utf-8")
+    for mod in (common, ingest):
+        monkeypatch.setattr(mod, "CORPUS_DIR", str(corpus))
+    return corpus
+
+
+def test_ingest_embed_then_swap_on_failure(tmp_path, monkeypatch):
+    _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
+    fake = FakeCollection()
+    monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+    monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: None)  # embedder down
+    rc = ingest.main()
+    assert rc == 1
+    ops = [c[0] for c in fake.calls]
+    assert "delete" not in ops and "add" not in ops  # old entries preserved
+
+
+def test_ingest_upsert_then_prune_no_loss_window(tmp_path, monkeypatch):
+    # A file that shrank from 3 chunks to 1: the new chunk is UPSERTED first,
+    # and only the stale higher-numbered ids are deleted, after the write.
+    corpus = _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
+    p = str(corpus / "a.md")
+    fake = FakeCollection(metadatas=[{"path": p, "chunk": i, "mtime": 1.0}
+                                     for i in range(3)],
+                          documents=["c0", "c1", "c2"])
+    monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+    monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0, 0.0])
+    assert ingest.main() == 0
+    ops = [c[0] for c in fake.calls if c[0] in ("delete", "add", "upsert")]
+    assert ops == ["upsert", "delete"]  # write first; prune after
+    _, up_kw = [c for c in fake.calls if c[0] == "upsert"][0]
+    assert up_kw["metadatas"][0]["lifecycle"] == "current"  # explicit key
+    _, del_kw = [c for c in fake.calls if c[0] == "delete"][0]
+    assert del_kw["ids"] == [f"{p}::1", f"{p}::2"]  # only the stale chunks
+
+
+def test_ingest_strips_frontmatter_from_embedded_text(tmp_path, monkeypatch):
+    _setup_corpus(tmp_path, monkeypatch,
+                  {"a.md": "---\nname: a\ndescription: x\n---\nreal body"})
+    fake = FakeCollection()
+    monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+    monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0])
+    assert ingest.main() == 0
+    _, up_kw = [c for c in fake.calls if c[0] == "upsert"][0]
+    assert up_kw["documents"][0] == "real body"
+
+
+def test_ingest_honors_rag_false_and_sweeps(tmp_path, monkeypatch):
+    _setup_corpus(tmp_path, monkeypatch,
+                  {"skip.md": "---\nrag: false\n---\nscratch"})
+    fake = FakeCollection(metadatas=[{"path": "/stale/old.md", "mtime": 1.0}])
+    monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+    monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0, 0.0])
+    assert ingest.main() == 0
+    deletes = [c for c in fake.calls if c[0] == "delete"]
+    assert any(c[1]["where"]["path"] == "/stale/old.md" for c in deletes)
+    assert not [c for c in fake.calls if c[0] == "add"]
+
+
+def test_ingest_mtime_tolerance_skips_unchanged(tmp_path, monkeypatch):
+    corpus = _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
+    mtime = os.path.getmtime(corpus / "a.md")
+    fake = FakeCollection(metadatas=[{"path": str(corpus / "a.md"),
+                                      "mtime": mtime + 0.0005}])  # sub-tolerance
+    monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+    calls = []
+    monkeypatch.setattr(ingest, "embed",
+                        lambda text, timeout=120.0: (calls.append(1) or [1.0]))
+    assert ingest.main() == 0 and calls == []
+
+
+def test_ingest_superseded_lifecycle_carried(tmp_path, monkeypatch):
+    _setup_corpus(tmp_path, monkeypatch,
+                  {"old.md": "---\nname: old\nlifecycle: superseded\n---\nbody"})
+    fake = FakeCollection()
+    monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+    monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0])
+    assert ingest.main() == 0
+    _, up_kw = [c for c in fake.calls if c[0] == "upsert"][0]
+    assert up_kw["metadatas"][0]["lifecycle"] == "superseded"
+
+
+# --- chunker + frontmatter --------------------------------------------------
+
+def test_heading_chunks_paths_and_merge():
+    text = ("# Top\n\nintro paragraph long enough to stand alone as a chunk "
+            "with plenty of characters in it to clear the merge threshold "
+            "for small trailing chunks in the splitter today\n\n"
+            "## Sub\n\ntiny\n")
+    chunks = common.heading_chunks(text)
+    assert chunks[0]["heading_path"] == "Top"
+    assert len(chunks) == 1  # "tiny" merged into previous
+    assert "tiny" in chunks[0]["text"]
+
+
+def test_heading_chunks_subsplit_oversize():
+    text = "# Big\n\n" + ("x" * (common.MAX_CHARS_EMBED * 2))
+    chunks = common.heading_chunks(text)
+    assert len(chunks) >= 2
+    assert all(len(c["text"]) <= common.MAX_CHARS_EMBED for c in chunks)
+    assert "[part 1]" in chunks[0]["heading_path"]
+
+
+def test_frontmatter_flags():
+    fm = common.parse_frontmatter("---\nrag: false\nrag_chunk: headings\n---\nx")
+    assert common.rag_enabled(fm) is False
+    assert common.chunk_mode(fm) == "headings"
+    assert common.rag_enabled({}) is True and common.chunk_mode({}) == "whole"
+
+
+def test_frontmatter_inline_comments_stripped():
+    # `rag: false  # why` must read as "false" — README-valid YAML that
+    # silently disabled every frontmatter control before the fix.
+    fm = common.parse_frontmatter(
+        "---\nrag: false  # scratch\nlifecycle: superseded # retired\n---\nx")
+    assert common.rag_enabled(fm) is False
+    assert fm["lifecycle"] == "superseded"
+
+
+def test_strip_frontmatter():
+    assert common.strip_frontmatter("---\nname: a\n---\n\nbody") == "body"
+    assert common.strip_frontmatter("no frontmatter") == "no frontmatter"
+
+
+# --- MCP layer (only if the SDK is installed) -------------------------------
+
+def test_mcp_layer_registers_two_readonly_tools():
+    pytest.importorskip("mcp")
+    srv = server.build_server()
+    assert srv is not None

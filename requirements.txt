@@ -1,0 +1,6 @@
+# Runtime
+mcp>=2.0,<3
+chromadb>=1.0,<2
+
+# The embedder is Ollama over HTTP (stdlib urllib) — no Python dependency.
+# Tests: pip install pytest (chromadb not required — the store is stubbed).
