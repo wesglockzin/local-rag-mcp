@@ -416,6 +416,7 @@ def test_help_exits_zero_without_settings_and_touches_nothing(
     monkeypatch.delenv("RAG_EMBED_MODEL")
     monkeypatch.setattr(common, "STORE_DIR", str(tmp_path / "store"))
     monkeypatch.setattr(ingest, "STORE_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(server, "STORE_DIR", str(tmp_path / "store"))
     with pytest.raises(SystemExit) as exc:
         module.main(["--help"])
     assert exc.value.code == 0
