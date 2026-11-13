@@ -13,18 +13,23 @@ ingest.py — idempotent ingest of the corpus into the local Chroma store.
     build can be pinned to exactly the corpus state that produced it.
 
 Run: python ingest.py [--force]
-Config via env: RAG_CORPUS_DIR, RAG_STORE_DIR, OLLAMA_HOST (see common.py).
+Config via env: RAG_CORPUS_DIR, RAG_STORE_DIR, OLLAMA_HOST and RAG_EMBED_MODEL
+(the last two are required; see common.py and .env.example).
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
 
 from common import (COLLECTION, CORPUS_DIR, MAX_CHARS_EMBED, STORE_DIR,
-                    chunk_mode, corpus_files, doc_prefix, embed,
-                    heading_chunks, parse_frontmatter, rag_enabled,
+                    ConfigError, EmbedError, chunk_mode, corpus_files,
+                    doc_prefix, embed, embed_model, heading_chunks,
+                    ollama_host, parse_frontmatter, rag_enabled,
                     strip_frontmatter)
+
+log = logging.getLogger("ingest")
 
 
 def get_collection():
@@ -58,12 +63,19 @@ def corpus_commit() -> str:
         if not sha:
             return "unknown (corpus is not a git repo)"
         return f"{sha} (uncommitted changes present)" if dirty else sha
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         return f"unknown ({type(e).__name__})"
 
 
 def main() -> int:
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
     force = "--force" in sys.argv
+    try:
+        ollama_host()
+        embed_model()
+    except ConfigError as e:
+        log.error("%s", e)
+        return 2
     col = get_collection()
     known = existing_mtimes(col)
     seen: set[str] = set()
@@ -95,9 +107,11 @@ def main() -> int:
                 title = os.path.basename(path)[:-3].replace("_", " ")
             else:
                 title = ch["heading_path"] or os.path.basename(path)
-            vec = embed(doc_prefix(title) + ch["text"][:MAX_CHARS_EMBED])
-            if vec is None:
-                print(f"  !! embed failed: {path} chunk {i} — keeping old index entries")
+            try:
+                vec = embed(doc_prefix(title) + ch["text"][:MAX_CHARS_EMBED])
+            except EmbedError as e:
+                log.error("  !! embed failed: %s chunk %d — keeping old index entries: %s",
+                          path, i, e)
                 ok = False
                 failed += 1
                 break
@@ -127,17 +141,17 @@ def main() -> int:
             if stale:
                 col.delete(ids=stale)
             added += 1
-            print(f"  + {os.path.basename(path)} ({len(ids)} chunk(s))")
+            log.info("  + %s (%d chunk(s))", os.path.basename(path), len(ids))
 
     for path in set(known) - seen:
         col.delete(where={"path": path})
         removed += 1
-        print(f"  - {os.path.basename(path)} (removed)")
+        log.info("  - %s (removed)", os.path.basename(path))
 
-    print(f"\ningest done: {added} (re)indexed, {skipped} unchanged, "
-          f"{removed} removed, {failed} failed")
-    print(f"  store: {col.count()} chunks @ {STORE_DIR}")
-    print(f"  corpus commit: {corpus_commit()}")
+    log.info("\ningest done: %d (re)indexed, %d unchanged, %d removed, %d failed",
+             added, skipped, removed, failed)
+    log.info("  store: %d chunks @ %s", col.count(), STORE_DIR)
+    log.info("  corpus commit: %s", corpus_commit())
     return 1 if failed else 0
 
 

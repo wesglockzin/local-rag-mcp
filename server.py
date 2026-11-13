@@ -29,9 +29,14 @@ thin registration at the bottom.
 """
 from __future__ import annotations
 
+import logging
 import os
+import sys
 
-from common import COLLECTION, STORE_DIR, cosine_score, embed_query
+from common import (COLLECTION, STORE_DIR, ConfigError, EmbedError,
+                    cosine_score, embed_model, embed_query, ollama_host)
+
+log = logging.getLogger("server")
 
 _collection = None
 
@@ -65,10 +70,11 @@ def do_search(query: str, k: int = 4) -> dict:
         return {"error": "invalid arguments: query=str, k=int required."}
     if len(q) < 3:
         return {"error": "query must be at least 3 characters."}
-    vec = embed_query(q)
-    if vec is None:
-        return {"error": "embedding unavailable (is Ollama up with "
-                "embeddinggemma pulled?). No search performed."}
+    try:
+        vec = embed_query(q)
+    except (ConfigError, EmbedError) as e:
+        log.error("embedding failed: %s", e)
+        return {"error": f"embedding unavailable: {e}. No search performed."}
     try:
         col = get_collection()
         if col.count() == 0:
@@ -95,7 +101,8 @@ def do_search(query: str, k: int = 4) -> dict:
         return {"query": q, "results": results}
     except FileNotFoundError as e:
         return {"error": str(e)}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - tool boundary: log, return structured error
+        log.exception("search failed")
         return {"error": f"{type(e).__name__}: {e}"}
 
 
@@ -107,7 +114,8 @@ def do_get_file(path: str) -> dict:
         got = col.get(where={"path": path}, include=["metadatas"])
     except FileNotFoundError as e:
         return {"error": str(e)}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - tool boundary: log, return structured error
+        log.exception("get_file lookup failed")
         return {"error": f"{type(e).__name__}: {e}"}
     mds = got["metadatas"] or []
     if not mds:
@@ -125,7 +133,8 @@ def do_get_file(path: str) -> dict:
             with open(path, encoding="utf-8", errors="replace") as f:
                 text = f.read()
             return {"path": path, "chars": len(text), "text": text[:50000]}
-        except Exception as e:
+        except OSError as e:
+            log.error("read failed for %s: %s", path, e)
             return {"error": f"read failed: {type(e).__name__}: {e}"}
     # File absent on disk (moved corpus, other machine): serve the indexed
     # chunk text rather than failing — the index has the content.
@@ -134,7 +143,8 @@ def do_get_file(path: str) -> dict:
         pairs = sorted(zip(got["metadatas"], got["documents"]),
                        key=lambda p: p[0].get("chunk", 0))
         chunks = [d for _, d in pairs]
-    except Exception:
+    except Exception:  # noqa: BLE001 - chroma raises varied types; log, report "no text"
+        log.exception("indexed-text lookup failed for %s", path)
         chunks = []
     if chunks:
         return {"path": path, "source": "index (file absent on disk)",
@@ -176,5 +186,18 @@ def build_server():
     return mcp
 
 
-if __name__ == "__main__":
+def main() -> int:
+    # stdout carries the MCP protocol on stdio, so diagnostics go to stderr.
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+    try:
+        ollama_host()
+        embed_model()
+    except ConfigError as e:
+        log.error("%s", e)
+        return 2
     build_server().run()  # stdio
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

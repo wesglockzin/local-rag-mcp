@@ -18,21 +18,19 @@ Design notes that are easy to miss:
 Configuration (environment):
   RAG_CORPUS_DIR   directory of *.md files to index (default: ./sample-corpus)
   RAG_STORE_DIR    where the Chroma store lives (default: ~/.local-rag-mcp/store)
-  OLLAMA_HOST      Ollama base URL (default: http://localhost:11434)
+  OLLAMA_HOST      Ollama base URL (REQUIRED, no default)
+  RAG_EMBED_MODEL  embedding model name (REQUIRED, no default)
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 
-OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-EMBED_MODEL = "embeddinggemma"
-
-# Must match across ingest and search, and matches the companion project
-# (claude-code-session-memory) exactly — same model, same regime, so scores
-# and the calibrated floor are comparable across both consumers.
+# Must match across ingest and search. The prefixes below are EmbeddingGemma's
+# documented regime; set RAG_EMBED_MODEL to a model that uses them.
 REGIME = "prefix-title-v1"
 QUERY_PREFIX = "task: search result | query: "
 
@@ -47,28 +45,70 @@ def doc_prefix(title: str) -> str:
     return f"title: {title} | text: "
 
 
-def embed(text: str, timeout: float = 120.0) -> list[float] | None:
-    """Embed via Ollama; newer /api/embed with /api/embeddings fallback."""
+class ConfigError(RuntimeError):
+    """A required setting is missing."""
+
+
+class EmbedError(RuntimeError):
+    """The embedding server could not produce a vector; the message says why."""
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ConfigError(f"required setting {name} is not set (see .env.example)")
+    return value
+
+
+def ollama_host() -> str:
+    return require_env("OLLAMA_HOST").rstrip("/")
+
+
+def embed_model() -> str:
+    return require_env("RAG_EMBED_MODEL")
+
+
+def _post_json(url: str, body: dict, timeout: float) -> dict:
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise EmbedError(f"HTTP {e.code} from {url}: {detail}") from e
+    except OSError as e:  # URLError, timeouts, refused connections
+        raise EmbedError(f"cannot reach {url}: {e}") from e
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        raise EmbedError(f"invalid JSON from {url}: {e}") from e
+
+
+def embed(text: str, timeout: float = 120.0) -> list[float]:
+    """Embed via Ollama; newer /api/embed with /api/embeddings fallback.
+    Raises EmbedError (with status and body for HTTP errors) on failure."""
+    host, model = ollama_host(), embed_model()
+    errors: list[str] = []
     for url, body, pick in (
-        (f"{OLLAMA}/api/embed", {"model": EMBED_MODEL, "input": text},
+        (f"{host}/api/embed", {"model": model, "input": text},
          lambda d: (d.get("embeddings") or [None])[0] or d.get("embedding")),
-        (f"{OLLAMA}/api/embeddings", {"model": EMBED_MODEL, "prompt": text},
+        (f"{host}/api/embeddings", {"model": model, "prompt": text},
          lambda d: d.get("embedding")),
     ):
         try:
-            req = urllib.request.Request(
-                url, data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                vec = pick(json.loads(r.read()))
-            if vec:
-                return vec
-        except Exception:
+            vec = pick(_post_json(url, body, timeout))
+        except EmbedError as e:
+            errors.append(str(e))
             continue
-    return None
+        if vec:
+            return vec
+        errors.append(f"no embedding in response from {url}")
+    raise EmbedError("; ".join(errors))
 
 
-def embed_query(text: str, timeout: float = 10.0) -> list[float] | None:
+def embed_query(text: str, timeout: float = 10.0) -> list[float]:
     """Query-side embed. ALL search paths use this — never raw embed()."""
     return embed(QUERY_PREFIX + text, timeout)
 
@@ -89,7 +129,7 @@ def parse_frontmatter(text: str) -> dict:
             # read as "false", not "false  # scratch notes" — otherwise every
             # frontmatter control silently stops matching its expected value
             # (adversarial-review finding; also patched in the companion repo).
-            raw = re.split(r"\s+#", val[1], 1)[0]
+            raw = re.split(r"\s+#", val[1], maxsplit=1)[0]
             fm[val[0]] = raw.strip().strip('"').strip("'")
     return fm
 

@@ -3,16 +3,24 @@ the embedder is stubbed and the collection is a fake that records calls.
 What's under test is the contracts — validation, the lifecycle pre-filter,
 get_file's corpus-only + symlink hardening, embed-then-swap ingest ordering,
 and the chunker. One optional test uses real chromadb if installed."""
+import json
 import os
-import sys
+import threading
+import warnings
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-import common  # noqa: E402
-import ingest  # noqa: E402
-import server  # noqa: E402
+import common
+import ingest
+import server
+
+
+@pytest.fixture(autouse=True)
+def _settings(monkeypatch):
+    # Plainly fake, non-routable values: nothing here is ever contacted.
+    monkeypatch.setenv("OLLAMA_HOST", "http://ollama.example.invalid")
+    monkeypatch.setenv("RAG_EMBED_MODEL", "test-model")
 
 
 class FakeCollection:
@@ -83,9 +91,12 @@ def test_search_clamps_k(monkeypatch):
 
 
 def test_search_fails_soft_when_embedder_down(monkeypatch):
-    monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: None)
+    def down(q, timeout=10.0):
+        raise common.EmbedError("HTTP 500 from fake: boom")
+
+    monkeypatch.setattr(server, "embed_query", down)
     out = server.do_search("valid query")
-    assert "error" in out and "Ollama" in out["error"]
+    assert "error" in out and "HTTP 500" in out["error"]
 
 
 def test_search_passes_lifecycle_prefilter(monkeypatch):
@@ -187,7 +198,10 @@ def test_ingest_embed_then_swap_on_failure(tmp_path, monkeypatch):
     _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
     fake = FakeCollection()
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
-    monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: None)  # embedder down
+    def down(text, timeout=120.0):
+        raise common.EmbedError("embedder down")
+
+    monkeypatch.setattr(ingest, "embed", down)
     rc = ingest.main()
     assert rc == 1
     ops = [c[0] for c in fake.calls]
@@ -299,6 +313,85 @@ def test_frontmatter_inline_comments_stripped():
 def test_strip_frontmatter():
     assert common.strip_frontmatter("---\nname: a\n---\n\nbody") == "body"
     assert common.strip_frontmatter("no frontmatter") == "no frontmatter"
+
+
+def test_frontmatter_parse_has_no_deprecation_warning():
+    # re.split(maxsplit) passed positionally is deprecated (error on 3.13+).
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        fm = common.parse_frontmatter("---\nrag: false  # scratch\n---\nbody")
+    assert fm["rag"] == "false"
+
+
+# --- settings ---------------------------------------------------------------
+
+def test_missing_ollama_host_names_the_setting(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST")
+    with pytest.raises(common.ConfigError, match="OLLAMA_HOST"):
+        common.embed("hello")
+
+
+def test_missing_model_names_the_setting(monkeypatch):
+    monkeypatch.delenv("RAG_EMBED_MODEL")
+    with pytest.raises(common.ConfigError, match="RAG_EMBED_MODEL"):
+        common.embed("hello")
+
+
+def test_ingest_and_server_refuse_to_start_without_settings(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST")
+    assert ingest.main() == 2
+    assert server.main() == 2
+
+
+# --- embed against a fake HTTP server --------------------------------------
+
+@pytest.fixture
+def fake_ollama(monkeypatch):
+    routes: dict[str, tuple[int, bytes]] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            status, body = routes.get(self.path, (404, b"not found"))
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("OLLAMA_HOST", f"http://127.0.0.1:{httpd.server_port}/")
+    yield routes
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def test_embed_uses_new_endpoint(fake_ollama):
+    fake_ollama["/api/embed"] = (200, json.dumps({"embeddings": [[0.5, 0.25]]}).encode())
+    assert common.embed("hi") == [0.5, 0.25]
+
+
+def test_embed_falls_back_to_legacy_endpoint(fake_ollama):
+    fake_ollama["/api/embeddings"] = (200, json.dumps({"embedding": [1.0]}).encode())
+    assert common.embed("hi") == [1.0]
+
+
+def test_embed_http_error_reports_status_and_body(fake_ollama):
+    fake_ollama["/api/embed"] = (500, b"model exploded")
+    fake_ollama["/api/embeddings"] = (500, b"model exploded")
+    with pytest.raises(common.EmbedError) as exc:
+        common.embed("hi")
+    assert "HTTP 500" in str(exc.value) and "model exploded" in str(exc.value)
+    assert "cannot reach" not in str(exc.value)
+
+
+def test_embed_unreachable_server_is_reported_as_unreachable(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:1")
+    with pytest.raises(common.EmbedError, match="cannot reach"):
+        common.embed("hi", timeout=2)
 
 
 # --- MCP layer (only if the SDK is installed) -------------------------------

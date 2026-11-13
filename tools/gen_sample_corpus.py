@@ -4,7 +4,9 @@ exercise every ingest behavior: whole-file embedding, heading-split chunking
 (`rag_chunk: headings`), exclusion (`rag: false`), and the superseded
 lifecycle filter. Committed so the quickstart works offline of this script;
 CI checks the committed files match this generator."""
+import logging
 import os
+import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORPUS = os.path.join(ROOT, "sample-corpus")
@@ -34,15 +36,15 @@ the March incident. Rule: non-trivial live changes ship in phases — canary
 region first, verify dashboards, then the rest. A bad batch is a full
 outage; a bad canary is a blip.
 """,
-    "reference_vpn_cert_bundle.md": """---
-name: reference_vpn_cert_bundle
-description: "Corporate VPN does TLS inspection; tools need the internal CA bundle"
+    "reference_ca_bundle.md": """---
+name: reference_ca_bundle
+description: "A TLS-inspecting proxy means tools need a custom CA bundle"
 metadata:
   type: reference
 ---
 
-The corporate VPN intercepts TLS. Python tools must set REQUESTS_CA_BUNDLE
-to the internal bundle at ~/.corp-ca-bundle.pem or requests fail with
+A TLS-inspecting proxy re-signs traffic. Python tools must set
+REQUESTS_CA_BUNDLE to the custom bundle or requests fail with
 certificate errors that look like outages. Node tools need
 NODE_EXTRA_CA_CERTS pointed at the same file.
 """,
@@ -117,8 +119,9 @@ def main() -> None:
     for name, body in DOCS.items():
         with open(os.path.join(CORPUS, name), "w", encoding="utf-8") as f:
             f.write(body)
-    print(f"wrote {len(DOCS)} documents -> {CORPUS}")
+    logging.getLogger(__name__).info("wrote %d documents -> %s", len(DOCS), CORPUS)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
     main()
