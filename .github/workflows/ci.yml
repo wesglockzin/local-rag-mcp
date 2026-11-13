@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,7 +35,16 @@ jobs:
       - name: tests (embedder stubbed — no Ollama in CI; real chromadb + mcp installed)
         run: python -m pytest -q
       - name: dependency audit
-        run: pip-audit .
+        # These four chromadb advisories have no fixed release as of 2026-11-13.
+        # They affect the chroma server, auth and tenant features, none of which
+        # this project uses: it uses only the embedded PersistentClient with
+        # explicit embeddings. Remove each ID once chromadb ships a fix.
+        run: >-
+          pip-audit .
+          --ignore-vuln PYSEC-2026-311
+          --ignore-vuln PYSEC-2026-3813
+          --ignore-vuln PYSEC-2026-3814
+          --ignore-vuln PYSEC-2026-3815
       - name: gitleaks
         uses: gitleaks/gitleaks-action@v3
         env:
