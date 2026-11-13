@@ -18,26 +18,29 @@ Design notes that are easy to miss:
 Configuration (environment):
   RAG_CORPUS_DIR   directory of *.md files to index (default: ./sample-corpus)
   RAG_STORE_DIR    where the Chroma store lives (default: ~/.local-rag-mcp/store)
-  OLLAMA_HOST      Ollama base URL (default: http://localhost:11434)
+  OLLAMA_HOST      Ollama base URL (REQUIRED, no default)
+  RAG_EMBED_MODEL  embedding model name (REQUIRED, no default)
 """
+
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
 import urllib.request
 
-OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-EMBED_MODEL = "embeddinggemma"
-
-# Must match across ingest and search, and matches the companion project
-# (claude-code-session-memory) exactly — same model, same regime, so scores
-# and the calibrated floor are comparable across both consumers.
+# Must match across ingest and search. The prefixes below are EmbeddingGemma's
+# documented regime; set RAG_EMBED_MODEL to a model that uses them.
 REGIME = "prefix-title-v1"
 QUERY_PREFIX = "task: search result | query: "
 
 CORPUS_DIR = os.path.abspath(os.environ.get("RAG_CORPUS_DIR", "sample-corpus"))
-STORE_DIR = os.path.expanduser(os.environ.get("RAG_STORE_DIR", "~/.local-rag-mcp/store"))
+STORE_DIR = os.path.expanduser(
+    os.environ.get("RAG_STORE_DIR", "~/.local-rag-mcp/store")
+)
 COLLECTION = "corpus"
 
 MAX_CHARS_EMBED = 6000
@@ -47,28 +50,108 @@ def doc_prefix(title: str) -> str:
     return f"title: {title} | text: "
 
 
-def embed(text: str, timeout: float = 120.0) -> list[float] | None:
-    """Embed via Ollama; newer /api/embed with /api/embeddings fallback."""
+class ConfigError(RuntimeError):
+    """A required setting is missing."""
+
+
+class EmbedError(RuntimeError):
+    """The embedding server could not produce a vector; the message says why."""
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ConfigError(f"required setting {name} is not set (see .env.example)")
+    return value
+
+
+def ollama_host() -> str:
+    value = require_env("OLLAMA_HOST").rstrip("/")
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ConfigError(
+            "setting OLLAMA_HOST must be a full URL starting with http:// or "
+            "https:// (for example https://ollama.example.invalid:11434)"
+        )
+    if "@" in parts.netloc:
+        raise ConfigError(
+            "setting OLLAMA_HOST must not contain a user:password@ part; "
+            "urllib does not send it as credentials"
+        )
+    try:
+        _ = parts.port  # reading it validates the port
+    except ValueError as e:
+        raise ConfigError(f"setting OLLAMA_HOST has an invalid port: {e}") from e
+    return value
+
+
+def _redact(url: str) -> str:
+    """Drop any user:password@ part so credentials never reach error text."""
+    parts = urllib.parse.urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    netloc = parts.netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc))
+
+
+def embed_model() -> str:
+    return require_env("RAG_EMBED_MODEL")
+
+
+def _post_json(url: str, body: dict, timeout: float) -> dict:
+    shown = _redact(url)
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    except ValueError as e:
+        raise EmbedError(f"invalid URL {shown}: {e}") from e
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise EmbedError(f"HTTP {e.code} from {shown}: {detail}") from e
+    except (OSError, http.client.HTTPException) as e:
+        # URLError, timeouts, refused connections, truncated responses
+        raise EmbedError(f"cannot reach {shown}: {e}") from e
+    try:
+        return json.loads(raw)
+    except ValueError as e:
+        raise EmbedError(f"invalid JSON from {shown}: {e}") from e
+
+
+def embed(text: str, timeout: float = 120.0) -> list[float]:
+    """Embed via Ollama; newer /api/embed with /api/embeddings fallback.
+    Raises EmbedError (with status and body for HTTP errors) on failure."""
+    host, model = ollama_host(), embed_model()
+    errors: list[str] = []
     for url, body, pick in (
-        (f"{OLLAMA}/api/embed", {"model": EMBED_MODEL, "input": text},
-         lambda d: (d.get("embeddings") or [None])[0] or d.get("embedding")),
-        (f"{OLLAMA}/api/embeddings", {"model": EMBED_MODEL, "prompt": text},
-         lambda d: d.get("embedding")),
+        (
+            f"{host}/api/embed",
+            {"model": model, "input": text},
+            lambda d: (d.get("embeddings") or [None])[0] or d.get("embedding"),
+        ),
+        (
+            f"{host}/api/embeddings",
+            {"model": model, "prompt": text},
+            lambda d: d.get("embedding"),
+        ),
     ):
         try:
-            req = urllib.request.Request(
-                url, data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                vec = pick(json.loads(r.read()))
-            if vec:
-                return vec
-        except Exception:
+            vec = pick(_post_json(url, body, timeout))
+        except EmbedError as e:
+            errors.append(str(e))
             continue
-    return None
+        if vec:
+            return vec
+        errors.append(f"no embedding in response from {url}")
+    raise EmbedError("; ".join(errors))
 
 
-def embed_query(text: str, timeout: float = 10.0) -> list[float] | None:
+def embed_query(text: str, timeout: float = 10.0) -> list[float]:
     """Query-side embed. ALL search paths use this — never raw embed()."""
     return embed(QUERY_PREFIX + text, timeout)
 
@@ -82,14 +165,16 @@ def parse_frontmatter(text: str) -> dict:
     if end < 0:
         return fm
     for line in text[3:end].splitlines():
-        m = re.match(r"^\s*(rag|rag_chunk|name|description|lifecycle)\s*:\s*(.+?)\s*$", line)
+        m = re.match(
+            r"^\s*(rag|rag_chunk|name|description|lifecycle)\s*:\s*(.+?)\s*$", line
+        )
         if m:
             val = m.group(1), m.group(2)
             # Strip YAML inline comments: `rag: false  # scratch notes` must
             # read as "false", not "false  # scratch notes" — otherwise every
             # frontmatter control silently stops matching its expected value
             # (adversarial-review finding; also patched in the companion repo).
-            raw = re.split(r"\s+#", val[1], 1)[0]
+            raw = re.split(r"\s+#", val[1], maxsplit=1)[0]
             fm[val[0]] = raw.strip().strip('"').strip("'")
     return fm
 
@@ -104,7 +189,7 @@ def strip_frontmatter(text: str) -> str:
     end = text.find("\n---", 3)
     if end < 0:
         return text
-    return text[end + 4:].lstrip("\n")
+    return text[end + 4 :].lstrip("\n")
 
 
 def rag_enabled(fm: dict) -> bool:
@@ -115,7 +200,11 @@ def rag_enabled(fm: dict) -> bool:
 def chunk_mode(fm: dict) -> str:
     """`rag_chunk: headings` opts a long document into heading-split chunks;
     default is one whole-file embedding (right for small, atomic files)."""
-    return "headings" if str(fm.get("rag_chunk", "whole")).lower() == "headings" else "whole"
+    return (
+        "headings"
+        if str(fm.get("rag_chunk", "whole")).lower() == "headings"
+        else "whole"
+    )
 
 
 def heading_chunks(text: str) -> list[dict]:
@@ -160,15 +249,22 @@ def heading_chunks(text: str) -> list[dict]:
             continue
         step = MAX_CHARS_EMBED - 200
         for j, start in enumerate(range(0, len(t), step)):
-            out.append({"text": t[start:start + MAX_CHARS_EMBED],
-                        "heading_path": f"{ch['heading_path']} [part {j+1}]"})
+            out.append(
+                {
+                    "text": t[start : start + MAX_CHARS_EMBED],
+                    "heading_path": f"{ch['heading_path']} [part {j + 1}]",
+                }
+            )
     return out
 
 
 def corpus_files() -> list[str]:
     """Sorted absolute paths of every *.md in the corpus directory."""
-    return [os.path.join(CORPUS_DIR, b)
-            for b in sorted(os.listdir(CORPUS_DIR)) if b.endswith(".md")]
+    return [
+        os.path.join(CORPUS_DIR, b)
+        for b in sorted(os.listdir(CORPUS_DIR))
+        if b.endswith(".md")
+    ]
 
 
 def cosine_score(distance: float) -> float:

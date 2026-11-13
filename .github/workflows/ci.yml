@@ -8,18 +8,49 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
         with:
-          python-version: "3.12"
-      - name: compile
-        run: python -m py_compile server.py ingest.py common.py tools/gen_sample_corpus.py tests/test_local_rag_mcp.py
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install
+        run: pip install -e ".[dev]" uv pip-audit deptry
+      - name: lockfile is current
+        run: uv lock --check
+      - name: lint
+        run: |
+          ruff check .
+          ruff format --check .
+          deptry .
       - name: sample corpus is in sync with its generator
         run: |
           python tools/gen_sample_corpus.py
           git diff --exit-code -- sample-corpus
       - name: tests (embedder stubbed — no Ollama in CI; real chromadb + mcp installed)
-        run: |
-          pip install -r requirements.txt pytest
-          python -m pytest -q
+        run: python -m pytest -q
+      - name: dependency audit
+        # Accepted by the owner (decision on DEP-2): four chromadb advisories
+        # with no fixed release. They concern Chroma's network server, which
+        # this tool never runs or connects to: it uses only PersistentClient
+        # on a local folder. tests/test_no_chroma_server.py guards this.
+        # Remove these ignores when a fixed chromadb release exists.
+        run: >-
+          pip-audit .
+          --ignore-vuln GHSA-2wm9-hf6c-p5cr
+          --ignore-vuln GHSA-36p7-vc44-83pf
+          --ignore-vuln GHSA-f4j7-r4q5-qw2c
+          --ignore-vuln GHSA-xph7-9rjv-w5fr
+          --ignore-vuln PYSEC-2026-311
+          --ignore-vuln PYSEC-2026-3813
+          --ignore-vuln PYSEC-2026-3814
+          --ignore-vuln PYSEC-2026-3815
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
