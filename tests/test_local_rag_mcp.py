@@ -372,6 +372,27 @@ def test_missing_model_names_the_setting(monkeypatch):
         common.embed("hello")
 
 
+@pytest.mark.parametrize("bad", ["0.0.0.0", "ollama", "localhost:11434", "http://"])
+def test_malformed_ollama_host_is_rejected_at_startup(monkeypatch, bad):
+    monkeypatch.setenv("OLLAMA_HOST", bad)
+    with pytest.raises(common.ConfigError, match="OLLAMA_HOST"):
+        common.ollama_host()
+    assert ingest.main() == 2
+    assert server.main() == 2
+
+
+def test_post_json_bad_url_becomes_embed_error():
+    with pytest.raises(common.EmbedError, match="invalid URL"):
+        common._post_json("0.0.0.0/api/embed", {}, 1)
+
+
+def test_error_text_hides_url_credentials(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://user:test-pw-not-real@127.0.0.1:1")
+    with pytest.raises(common.EmbedError) as exc:
+        common.embed("hi", timeout=2)
+    assert "test-pw-not-real" not in str(exc.value)
+
+
 def test_ingest_and_server_refuse_to_start_without_settings(monkeypatch):
     monkeypatch.delenv("OLLAMA_HOST")
     assert ingest.main() == 2

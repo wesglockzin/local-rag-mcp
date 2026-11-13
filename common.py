@@ -24,10 +24,12 @@ Configuration (environment):
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Must match across ingest and search. The prefixes below are EmbeddingGemma's
@@ -64,7 +66,23 @@ def require_env(name: str) -> str:
 
 
 def ollama_host() -> str:
-    return require_env("OLLAMA_HOST").rstrip("/")
+    value = require_env("OLLAMA_HOST").rstrip("/")
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ConfigError(
+            "setting OLLAMA_HOST must be a full URL starting with http:// or "
+            "https:// (for example https://ollama.example.invalid:11434)"
+        )
+    return value
+
+
+def _redact(url: str) -> str:
+    """Drop any user:password@ part so credentials never reach error text."""
+    parts = urllib.parse.urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    netloc = parts.netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc))
 
 
 def embed_model() -> str:
@@ -72,23 +90,28 @@ def embed_model() -> str:
 
 
 def _post_json(url: str, body: dict, timeout: float) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+    shown = _redact(url)
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    except ValueError as e:
+        raise EmbedError(f"invalid URL {shown}: {e}") from e
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:500]
-        raise EmbedError(f"HTTP {e.code} from {url}: {detail}") from e
-    except OSError as e:  # URLError, timeouts, refused connections
-        raise EmbedError(f"cannot reach {url}: {e}") from e
+        raise EmbedError(f"HTTP {e.code} from {shown}: {detail}") from e
+    except (OSError, http.client.HTTPException) as e:
+        # URLError, timeouts, refused connections, truncated responses
+        raise EmbedError(f"cannot reach {shown}: {e}") from e
     try:
         return json.loads(raw)
     except ValueError as e:
-        raise EmbedError(f"invalid JSON from {url}: {e}") from e
+        raise EmbedError(f"invalid JSON from {shown}: {e}") from e
 
 
 def embed(text: str, timeout: float = 120.0) -> list[float]:
