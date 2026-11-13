@@ -3,6 +3,10 @@ title = "local-rag-mcp rules"
 [extend]
 useDefault = true
 
+[allowlist]
+description = "Plainly fake password in an earlier commit of the test file"
+regexes = ['''test-pw-not-real''']
+
 [[rules]]
 id = "internal-hostname"
 description = "Internal hostname suffix"
