@@ -19,6 +19,7 @@ Config via env: RAG_CORPUS_DIR, RAG_STORE_DIR, OLLAMA_HOST and RAG_EMBED_MODEL
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import subprocess
@@ -92,9 +93,16 @@ def corpus_commit() -> str:
         return f"unknown ({type(e).__name__})"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="local-rag-ingest",
+        description="Index the corpus of *.md files into the local Chroma store.",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="re-embed files even if unchanged"
+    )
+    force = parser.parse_args(argv).force
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
-    force = "--force" in sys.argv
     try:
         ollama_host()
         embed_model()

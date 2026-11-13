@@ -30,6 +30,7 @@ thin registration at the bottom.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -216,7 +217,14 @@ def build_server():
     return mcp
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    argparse.ArgumentParser(
+        prog="local-rag-server",
+        description=(
+            "Read-only MCP server (stdio) for semantic search over the indexed "
+            "corpus. Settings come from environment variables; see README."
+        ),
+    ).parse_args(argv)
     # stdout carries the MCP protocol on stdio, so diagnostics go to stderr.
     logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     try:

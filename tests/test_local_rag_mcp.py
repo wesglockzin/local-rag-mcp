@@ -22,6 +22,8 @@ def _settings(monkeypatch):
     # Plainly fake, non-routable values: nothing here is ever contacted.
     monkeypatch.setenv("OLLAMA_HOST", "http://ollama.example.invalid")
     monkeypatch.setenv("RAG_EMBED_MODEL", "test-model")
+    # main() parses sys.argv by default; keep pytest's own arguments out of it.
+    monkeypatch.setattr("sys.argv", ["prog"])
 
 
 class FakeCollection:
@@ -386,11 +388,48 @@ def test_post_json_bad_url_becomes_embed_error():
         common._post_json("0.0.0.0/api/embed", {}, 1)
 
 
-def test_error_text_hides_url_credentials(monkeypatch):
-    monkeypatch.setenv("OLLAMA_HOST", "http://user:test-pw-not-real@127.0.0.1:1")
+def test_error_text_hides_url_credentials():
+    url = "http://user:" + "fake-credential" + "@127.0.0.1:1/api/embed"
     with pytest.raises(common.EmbedError) as exc:
-        common.embed("hi", timeout=2)
-    assert "test-pw-not-real" not in str(exc.value)
+        common._post_json(url, {}, 2)
+    assert "fake-credential" not in str(exc.value)
+
+
+def test_host_with_credentials_is_rejected_at_startup(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://user:" + "fake-credential" + "@proxy:1")
+    with pytest.raises(common.ConfigError, match="OLLAMA_HOST"):
+        common.ollama_host()
+    assert ingest.main() == 2
+
+
+def test_host_with_non_numeric_port_is_rejected_at_startup(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://127.0.0.1:abc")
+    with pytest.raises(common.ConfigError, match="OLLAMA_HOST"):
+        common.ollama_host()
+
+
+@pytest.mark.parametrize("module", [ingest, server])
+def test_help_exits_zero_without_settings_and_touches_nothing(
+    monkeypatch, tmp_path, capsys, module
+):
+    monkeypatch.delenv("OLLAMA_HOST")
+    monkeypatch.delenv("RAG_EMBED_MODEL")
+    monkeypatch.setattr(common, "STORE_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(ingest, "STORE_DIR", str(tmp_path / "store"))
+    with pytest.raises(SystemExit) as exc:
+        module.main(["--help"])
+    assert exc.value.code == 0
+    assert "usage" in capsys.readouterr().out.lower()
+    assert not (tmp_path / "store").exists()
+
+
+def test_ingest_force_flag_is_parsed(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST")
+    # Settings are checked after parsing: an unknown flag exits 2 via argparse,
+    # a known one reaches the settings check and returns 2 from main.
+    assert ingest.main(["--force"]) == 2
+    with pytest.raises(SystemExit):
+        ingest.main(["--bogus"])
 
 
 def test_ingest_and_server_refuse_to_start_without_settings(monkeypatch):
@@ -446,6 +485,35 @@ def test_embed_http_error_reports_status_and_body(fake_ollama):
         common.embed("hi")
     assert "HTTP 500" in str(exc.value) and "model exploded" in str(exc.value)
     assert "cannot reach" not in str(exc.value)
+
+
+def test_embed_truncated_response_becomes_embed_error(monkeypatch):
+    import socket
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n"
+                b"Connection: close\r\n\r\nshort"
+            )
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    monkeypatch.setenv("OLLAMA_HOST", f"http://127.0.0.1:{srv.getsockname()[1]}")
+    try:
+        with pytest.raises(common.EmbedError, match="cannot reach"):
+            common.embed("hi", timeout=5)
+    finally:
+        srv.close()
 
 
 def test_embed_unreachable_server_is_reported_as_unreachable(monkeypatch):

@@ -73,6 +73,15 @@ def ollama_host() -> str:
             "setting OLLAMA_HOST must be a full URL starting with http:// or "
             "https:// (for example https://ollama.example.invalid:11434)"
         )
+    if "@" in parts.netloc:
+        raise ConfigError(
+            "setting OLLAMA_HOST must not contain a user:password@ part; "
+            "urllib does not send it as credentials"
+        )
+    try:
+        _ = parts.port  # reading it validates the port
+    except ValueError as e:
+        raise ConfigError(f"setting OLLAMA_HOST has an invalid port: {e}") from e
     return value
 
 
