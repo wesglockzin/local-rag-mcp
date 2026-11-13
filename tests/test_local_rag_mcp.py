@@ -3,6 +3,7 @@ the embedder is stubbed and the collection is a fake that records calls.
 What's under test is the contracts — validation, the lifecycle pre-filter,
 get_file's corpus-only + symlink hardening, embed-then-swap ingest ordering,
 and the chunker. One optional test uses real chromadb if installed."""
+
 import json
 import os
 import threading
@@ -35,22 +36,33 @@ class FakeCollection:
     def query(self, **kw):
         self.calls.append(("query", kw))
         n = kw.get("n_results", 4)
-        return {"documents": [self.documents[:n]],
-                "metadatas": [self.metadatas[:n]],
-                "distances": [[0.2] * min(n, len(self.metadatas))]}
+        return {
+            "documents": [self.documents[:n]],
+            "metadatas": [self.metadatas[:n]],
+            "distances": [[0.2] * min(n, len(self.metadatas))],
+        }
 
     def get(self, **kw):
         self.calls.append(("get", kw))
         where = kw.get("where")
         if where and "path" in where:
-            keep = [(m, d) for m, d in zip(
-                self.metadatas, self.documents or [None] * len(self.metadatas))
-                if m.get("path") == where["path"]]
-            return {"ids": [f"{m.get('path')}::{m.get('chunk', 0)}" for m, _ in keep],
-                    "metadatas": [m for m, _ in keep],
-                    "documents": [d for _, d in keep]}
-        return {"ids": [f"{m.get('path')}::{m.get('chunk', 0)}" for m in self.metadatas],
-                "metadatas": self.metadatas, "documents": self.documents}
+            keep = [
+                (m, d)
+                for m, d in zip(
+                    self.metadatas, self.documents or [None] * len(self.metadatas)
+                )
+                if m.get("path") == where["path"]
+            ]
+            return {
+                "ids": [f"{m.get('path')}::{m.get('chunk', 0)}" for m, _ in keep],
+                "metadatas": [m for m, _ in keep],
+                "documents": [d for _, d in keep],
+            }
+        return {
+            "ids": [f"{m.get('path')}::{m.get('chunk', 0)}" for m in self.metadatas],
+            "metadatas": self.metadatas,
+            "documents": self.documents,
+        }
 
     def delete(self, **kw):
         self.calls.append(("delete", kw))
@@ -71,6 +83,7 @@ def reset_collection(monkeypatch):
 
 # --- do_search --------------------------------------------------------------
 
+
 def test_search_rejects_short_query():
     assert "error" in server.do_search("ab")
 
@@ -80,9 +93,10 @@ def test_search_rejects_bad_k():
 
 
 def test_search_clamps_k(monkeypatch):
-    fake = FakeCollection(metadatas=[{"path": f"/p{i}", "lifecycle": "current"}
-                                     for i in range(30)],
-                          documents=[f"doc {i}" for i in range(30)])
+    fake = FakeCollection(
+        metadatas=[{"path": f"/p{i}", "lifecycle": "current"} for i in range(30)],
+        documents=[f"doc {i}" for i in range(30)],
+    )
     monkeypatch.setattr(server, "get_collection", lambda: fake)
     monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: [1.0, 0.0])
     server.do_search("valid query", k=999)
@@ -100,8 +114,9 @@ def test_search_fails_soft_when_embedder_down(monkeypatch):
 
 
 def test_search_passes_lifecycle_prefilter(monkeypatch):
-    fake = FakeCollection(metadatas=[{"path": "/p", "lifecycle": "current"}],
-                          documents=["doc"])
+    fake = FakeCollection(
+        metadatas=[{"path": "/p", "lifecycle": "current"}], documents=["doc"]
+    )
     monkeypatch.setattr(server, "get_collection", lambda: fake)
     monkeypatch.setattr(server, "embed_query", lambda q, timeout=10.0: [1.0, 0.0])
     out = server.do_search("valid query")
@@ -119,9 +134,11 @@ def test_search_reports_missing_store(monkeypatch, tmp_path):
 
 # --- do_get_file ------------------------------------------------------------
 
+
 def test_get_file_refuses_non_corpus_path(monkeypatch):
-    fake = FakeCollection(metadatas=[{"path": "/corpus/a.md",
-                                      "real_path": "/corpus/a.md"}])
+    fake = FakeCollection(
+        metadatas=[{"path": "/corpus/a.md", "real_path": "/corpus/a.md"}]
+    )
     monkeypatch.setattr(server, "get_collection", lambda: fake)
     out = server.do_get_file("/etc/hosts")
     assert "error" in out and "hint" in out
@@ -143,8 +160,9 @@ def test_get_file_refuses_swapped_symlink(tmp_path, monkeypatch):
 def test_get_file_reads_valid_indexed_file(tmp_path, monkeypatch):
     p = tmp_path / "a.md"
     p.write_text("hello corpus", encoding="utf-8")
-    fake = FakeCollection(metadatas=[{"path": str(p),
-                                      "real_path": os.path.realpath(str(p))}])
+    fake = FakeCollection(
+        metadatas=[{"path": str(p), "real_path": os.path.realpath(str(p))}]
+    )
     monkeypatch.setattr(server, "get_collection", lambda: fake)
     out = server.do_get_file(str(p))
     assert out["text"] == "hello corpus"
@@ -153,9 +171,12 @@ def test_get_file_reads_valid_indexed_file(tmp_path, monkeypatch):
 def test_get_file_serves_index_text_when_file_absent(tmp_path, monkeypatch):
     gone = str(tmp_path / "gone.md")
     fake = FakeCollection(
-        metadatas=[{"path": gone, "real_path": gone, "chunk": 1},
-                   {"path": gone, "real_path": gone, "chunk": 0}],
-        documents=["second", "first"])
+        metadatas=[
+            {"path": gone, "real_path": gone, "chunk": 1},
+            {"path": gone, "real_path": gone, "chunk": 0},
+        ],
+        documents=["second", "first"],
+    )
     monkeypatch.setattr(server, "get_collection", lambda: fake)
     out = server.do_get_file(gone)
     assert out["source"].startswith("index")
@@ -163,6 +184,7 @@ def test_get_file_serves_index_text_when_file_absent(tmp_path, monkeypatch):
 
 
 # --- read-only contract -----------------------------------------------------
+
 
 def test_server_never_creates_store(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "STORE_DIR", str(tmp_path / "absent"))
@@ -184,6 +206,7 @@ def test_server_refuses_empty_store_dir(tmp_path, monkeypatch):
 
 # --- ingest contracts -------------------------------------------------------
 
+
 def _setup_corpus(tmp_path, monkeypatch, files):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -198,6 +221,7 @@ def test_ingest_embed_then_swap_on_failure(tmp_path, monkeypatch):
     _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
     fake = FakeCollection()
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
+
     def down(text, timeout=120.0):
         raise common.EmbedError("embedder down")
 
@@ -213,9 +237,10 @@ def test_ingest_upsert_then_prune_no_loss_window(tmp_path, monkeypatch):
     # and only the stale higher-numbered ids are deleted, after the write.
     corpus = _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
     p = str(corpus / "a.md")
-    fake = FakeCollection(metadatas=[{"path": p, "chunk": i, "mtime": 1.0}
-                                     for i in range(3)],
-                          documents=["c0", "c1", "c2"])
+    fake = FakeCollection(
+        metadatas=[{"path": p, "chunk": i, "mtime": 1.0} for i in range(3)],
+        documents=["c0", "c1", "c2"],
+    )
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
     monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0, 0.0])
     assert ingest.main() == 0
@@ -228,8 +253,9 @@ def test_ingest_upsert_then_prune_no_loss_window(tmp_path, monkeypatch):
 
 
 def test_ingest_strips_frontmatter_from_embedded_text(tmp_path, monkeypatch):
-    _setup_corpus(tmp_path, monkeypatch,
-                  {"a.md": "---\nname: a\ndescription: x\n---\nreal body"})
+    _setup_corpus(
+        tmp_path, monkeypatch, {"a.md": "---\nname: a\ndescription: x\n---\nreal body"}
+    )
     fake = FakeCollection()
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
     monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0])
@@ -239,8 +265,7 @@ def test_ingest_strips_frontmatter_from_embedded_text(tmp_path, monkeypatch):
 
 
 def test_ingest_honors_rag_false_and_sweeps(tmp_path, monkeypatch):
-    _setup_corpus(tmp_path, monkeypatch,
-                  {"skip.md": "---\nrag: false\n---\nscratch"})
+    _setup_corpus(tmp_path, monkeypatch, {"skip.md": "---\nrag: false\n---\nscratch"})
     fake = FakeCollection(metadatas=[{"path": "/stale/old.md", "mtime": 1.0}])
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
     monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0, 0.0])
@@ -253,18 +278,23 @@ def test_ingest_honors_rag_false_and_sweeps(tmp_path, monkeypatch):
 def test_ingest_mtime_tolerance_skips_unchanged(tmp_path, monkeypatch):
     corpus = _setup_corpus(tmp_path, monkeypatch, {"a.md": "---\nname: a\n---\nbody"})
     mtime = os.path.getmtime(corpus / "a.md")
-    fake = FakeCollection(metadatas=[{"path": str(corpus / "a.md"),
-                                      "mtime": mtime + 0.0005}])  # sub-tolerance
+    fake = FakeCollection(
+        metadatas=[{"path": str(corpus / "a.md"), "mtime": mtime + 0.0005}]
+    )  # sub-tolerance
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
     calls = []
-    monkeypatch.setattr(ingest, "embed",
-                        lambda text, timeout=120.0: (calls.append(1) or [1.0]))
+    monkeypatch.setattr(
+        ingest, "embed", lambda text, timeout=120.0: calls.append(1) or [1.0]
+    )
     assert ingest.main() == 0 and calls == []
 
 
 def test_ingest_superseded_lifecycle_carried(tmp_path, monkeypatch):
-    _setup_corpus(tmp_path, monkeypatch,
-                  {"old.md": "---\nname: old\nlifecycle: superseded\n---\nbody"})
+    _setup_corpus(
+        tmp_path,
+        monkeypatch,
+        {"old.md": "---\nname: old\nlifecycle: superseded\n---\nbody"},
+    )
     fake = FakeCollection()
     monkeypatch.setattr(ingest, "get_collection", lambda: fake)
     monkeypatch.setattr(ingest, "embed", lambda text, timeout=120.0: [1.0])
@@ -275,11 +305,14 @@ def test_ingest_superseded_lifecycle_carried(tmp_path, monkeypatch):
 
 # --- chunker + frontmatter --------------------------------------------------
 
+
 def test_heading_chunks_paths_and_merge():
-    text = ("# Top\n\nintro paragraph long enough to stand alone as a chunk "
-            "with plenty of characters in it to clear the merge threshold "
-            "for small trailing chunks in the splitter today\n\n"
-            "## Sub\n\ntiny\n")
+    text = (
+        "# Top\n\nintro paragraph long enough to stand alone as a chunk "
+        "with plenty of characters in it to clear the merge threshold "
+        "for small trailing chunks in the splitter today\n\n"
+        "## Sub\n\ntiny\n"
+    )
     chunks = common.heading_chunks(text)
     assert chunks[0]["heading_path"] == "Top"
     assert len(chunks) == 1  # "tiny" merged into previous
@@ -305,7 +338,8 @@ def test_frontmatter_inline_comments_stripped():
     # `rag: false  # why` must read as "false" — README-valid YAML that
     # silently disabled every frontmatter control before the fix.
     fm = common.parse_frontmatter(
-        "---\nrag: false  # scratch\nlifecycle: superseded # retired\n---\nx")
+        "---\nrag: false  # scratch\nlifecycle: superseded # retired\n---\nx"
+    )
     assert common.rag_enabled(fm) is False
     assert fm["lifecycle"] == "superseded"
 
@@ -324,6 +358,7 @@ def test_frontmatter_parse_has_no_deprecation_warning():
 
 
 # --- settings ---------------------------------------------------------------
+
 
 def test_missing_ollama_host_names_the_setting(monkeypatch):
     monkeypatch.delenv("OLLAMA_HOST")
@@ -344,6 +379,7 @@ def test_ingest_and_server_refuse_to_start_without_settings(monkeypatch):
 
 
 # --- embed against a fake HTTP server --------------------------------------
+
 
 @pytest.fixture
 def fake_ollama(monkeypatch):
@@ -370,7 +406,10 @@ def fake_ollama(monkeypatch):
 
 
 def test_embed_uses_new_endpoint(fake_ollama):
-    fake_ollama["/api/embed"] = (200, json.dumps({"embeddings": [[0.5, 0.25]]}).encode())
+    fake_ollama["/api/embed"] = (
+        200,
+        json.dumps({"embeddings": [[0.5, 0.25]]}).encode(),
+    )
     assert common.embed("hi") == [0.5, 0.25]
 
 
@@ -395,6 +434,7 @@ def test_embed_unreachable_server_is_reported_as_unreachable(monkeypatch):
 
 
 # --- MCP layer (only if the SDK is installed) -------------------------------
+
 
 def test_mcp_layer_registers_two_readonly_tools():
     pytest.importorskip("mcp")

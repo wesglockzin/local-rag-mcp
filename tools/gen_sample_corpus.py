@@ -4,6 +4,7 @@ exercise every ingest behavior: whole-file embedding, heading-split chunking
 (`rag_chunk: headings`), exclusion (`rag: false`), and the superseded
 lifecycle filter. Committed so the quickstart works offline of this script;
 CI checks the committed files match this generator."""
+
 import logging
 import os
 import sys

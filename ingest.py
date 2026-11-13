@@ -16,6 +16,7 @@ Run: python ingest.py [--force]
 Config via env: RAG_CORPUS_DIR, RAG_STORE_DIR, OLLAMA_HOST and RAG_EMBED_MODEL
 (the last two are required; see common.py and .env.example).
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,11 +24,24 @@ import os
 import subprocess
 import sys
 
-from common import (COLLECTION, CORPUS_DIR, MAX_CHARS_EMBED, STORE_DIR,
-                    ConfigError, EmbedError, chunk_mode, corpus_files,
-                    doc_prefix, embed, embed_model, heading_chunks,
-                    ollama_host, parse_frontmatter, rag_enabled,
-                    strip_frontmatter)
+from common import (
+    COLLECTION,
+    CORPUS_DIR,
+    MAX_CHARS_EMBED,
+    STORE_DIR,
+    ConfigError,
+    EmbedError,
+    chunk_mode,
+    corpus_files,
+    doc_prefix,
+    embed,
+    embed_model,
+    heading_chunks,
+    ollama_host,
+    parse_frontmatter,
+    rag_enabled,
+    strip_frontmatter,
+)
 
 log = logging.getLogger("ingest")
 
@@ -35,11 +49,14 @@ log = logging.getLogger("ingest")
 def get_collection():
     import chromadb
     from chromadb.config import Settings
+
     os.makedirs(STORE_DIR, exist_ok=True)
     client = chromadb.PersistentClient(
-        path=STORE_DIR, settings=Settings(anonymized_telemetry=False))
+        path=STORE_DIR, settings=Settings(anonymized_telemetry=False)
+    )
     return client.get_or_create_collection(
-        COLLECTION, metadata={"hnsw:space": "cosine"})
+        COLLECTION, metadata={"hnsw:space": "cosine"}
+    )
 
 
 def existing_mtimes(col) -> dict[str, float]:
@@ -56,10 +73,18 @@ def corpus_commit() -> str:
     """Reproducibility stamp — 'uncommitted changes present' is a warning
     label, and 'unknown' must never crash an ingest over a diagnostic."""
     try:
-        dirty = subprocess.run(["git", "-C", CORPUS_DIR, "status", "--porcelain"],
-                               capture_output=True, text=True, timeout=10).stdout.strip()
-        sha = subprocess.run(["git", "-C", CORPUS_DIR, "rev-parse", "--short", "HEAD"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", CORPUS_DIR, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        sha = subprocess.run(
+            ["git", "-C", CORPUS_DIR, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
         if not sha:
             return "unknown (corpus is not a git repo)"
         return f"{sha} (uncommitted changes present)" if dirty else sha
@@ -110,25 +135,35 @@ def main() -> int:
             try:
                 vec = embed(doc_prefix(title) + ch["text"][:MAX_CHARS_EMBED])
             except EmbedError as e:
-                log.error("  !! embed failed: %s chunk %d — keeping old index entries: %s",
-                          path, i, e)
+                log.error(
+                    "  !! embed failed: %s chunk %d — keeping old index entries: %s",
+                    path,
+                    i,
+                    e,
+                )
                 ok = False
                 failed += 1
                 break
             ids.append(f"{path}::{i}")
             embs.append(vec)
             docs.append(ch["text"][:MAX_CHARS_EMBED])
-            metas.append({"path": path, "chunk": i, "mtime": mtime,
-                          "heading_path": ch["heading_path"],
-                          "real_path": os.path.realpath(path),
-                          "name": fm.get("name", os.path.basename(path)),
-                          # Written explicitly for EVERY chunk: the search-side
-                          # superseded pre-filter stands on this key, and a
-                          # missing key is not a safe default under $ne on all
-                          # Chroma versions. A re-ingest that dropped this
-                          # silently re-exposed retired docs in the original —
-                          # found by a regression test, kept by this line.
-                          "lifecycle": fm.get("lifecycle", "current")})
+            metas.append(
+                {
+                    "path": path,
+                    "chunk": i,
+                    "mtime": mtime,
+                    "heading_path": ch["heading_path"],
+                    "real_path": os.path.realpath(path),
+                    "name": fm.get("name", os.path.basename(path)),
+                    # Written explicitly for EVERY chunk: the search-side
+                    # superseded pre-filter stands on this key, and a
+                    # missing key is not a safe default under $ne on all
+                    # Chroma versions. A re-ingest that dropped this
+                    # silently re-exposed retired docs in the original —
+                    # found by a regression test, kept by this line.
+                    "lifecycle": fm.get("lifecycle", "current"),
+                }
+            )
         if ok and ids:
             # UPSERT-then-prune, not delete-then-add: a failure between a
             # delete and an add would lose the file from the index entirely
@@ -148,8 +183,13 @@ def main() -> int:
         removed += 1
         log.info("  - %s (removed)", os.path.basename(path))
 
-    log.info("\ningest done: %d (re)indexed, %d unchanged, %d removed, %d failed",
-             added, skipped, removed, failed)
+    log.info(
+        "\ningest done: %d (re)indexed, %d unchanged, %d removed, %d failed",
+        added,
+        skipped,
+        removed,
+        failed,
+    )
     log.info("  store: %d chunks @ %s", col.count(), STORE_DIR)
     log.info("  corpus commit: %s", corpus_commit())
     return 1 if failed else 0

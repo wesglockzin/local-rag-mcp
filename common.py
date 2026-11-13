@@ -21,6 +21,7 @@ Configuration (environment):
   OLLAMA_HOST      Ollama base URL (REQUIRED, no default)
   RAG_EMBED_MODEL  embedding model name (REQUIRED, no default)
 """
+
 from __future__ import annotations
 
 import json
@@ -35,7 +36,9 @@ REGIME = "prefix-title-v1"
 QUERY_PREFIX = "task: search result | query: "
 
 CORPUS_DIR = os.path.abspath(os.environ.get("RAG_CORPUS_DIR", "sample-corpus"))
-STORE_DIR = os.path.expanduser(os.environ.get("RAG_STORE_DIR", "~/.local-rag-mcp/store"))
+STORE_DIR = os.path.expanduser(
+    os.environ.get("RAG_STORE_DIR", "~/.local-rag-mcp/store")
+)
 COLLECTION = "corpus"
 
 MAX_CHARS_EMBED = 6000
@@ -70,8 +73,10 @@ def embed_model() -> str:
 
 def _post_json(url: str, body: dict, timeout: float) -> dict:
     req = urllib.request.Request(
-        url, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"})
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -92,10 +97,16 @@ def embed(text: str, timeout: float = 120.0) -> list[float]:
     host, model = ollama_host(), embed_model()
     errors: list[str] = []
     for url, body, pick in (
-        (f"{host}/api/embed", {"model": model, "input": text},
-         lambda d: (d.get("embeddings") or [None])[0] or d.get("embedding")),
-        (f"{host}/api/embeddings", {"model": model, "prompt": text},
-         lambda d: d.get("embedding")),
+        (
+            f"{host}/api/embed",
+            {"model": model, "input": text},
+            lambda d: (d.get("embeddings") or [None])[0] or d.get("embedding"),
+        ),
+        (
+            f"{host}/api/embeddings",
+            {"model": model, "prompt": text},
+            lambda d: d.get("embedding"),
+        ),
     ):
         try:
             vec = pick(_post_json(url, body, timeout))
@@ -122,7 +133,9 @@ def parse_frontmatter(text: str) -> dict:
     if end < 0:
         return fm
     for line in text[3:end].splitlines():
-        m = re.match(r"^\s*(rag|rag_chunk|name|description|lifecycle)\s*:\s*(.+?)\s*$", line)
+        m = re.match(
+            r"^\s*(rag|rag_chunk|name|description|lifecycle)\s*:\s*(.+?)\s*$", line
+        )
         if m:
             val = m.group(1), m.group(2)
             # Strip YAML inline comments: `rag: false  # scratch notes` must
@@ -144,7 +157,7 @@ def strip_frontmatter(text: str) -> str:
     end = text.find("\n---", 3)
     if end < 0:
         return text
-    return text[end + 4:].lstrip("\n")
+    return text[end + 4 :].lstrip("\n")
 
 
 def rag_enabled(fm: dict) -> bool:
@@ -155,7 +168,11 @@ def rag_enabled(fm: dict) -> bool:
 def chunk_mode(fm: dict) -> str:
     """`rag_chunk: headings` opts a long document into heading-split chunks;
     default is one whole-file embedding (right for small, atomic files)."""
-    return "headings" if str(fm.get("rag_chunk", "whole")).lower() == "headings" else "whole"
+    return (
+        "headings"
+        if str(fm.get("rag_chunk", "whole")).lower() == "headings"
+        else "whole"
+    )
 
 
 def heading_chunks(text: str) -> list[dict]:
@@ -200,15 +217,22 @@ def heading_chunks(text: str) -> list[dict]:
             continue
         step = MAX_CHARS_EMBED - 200
         for j, start in enumerate(range(0, len(t), step)):
-            out.append({"text": t[start:start + MAX_CHARS_EMBED],
-                        "heading_path": f"{ch['heading_path']} [part {j+1}]"})
+            out.append(
+                {
+                    "text": t[start : start + MAX_CHARS_EMBED],
+                    "heading_path": f"{ch['heading_path']} [part {j + 1}]",
+                }
+            )
     return out
 
 
 def corpus_files() -> list[str]:
     """Sorted absolute paths of every *.md in the corpus directory."""
-    return [os.path.join(CORPUS_DIR, b)
-            for b in sorted(os.listdir(CORPUS_DIR)) if b.endswith(".md")]
+    return [
+        os.path.join(CORPUS_DIR, b)
+        for b in sorted(os.listdir(CORPUS_DIR))
+        if b.endswith(".md")
+    ]
 
 
 def cosine_score(distance: float) -> float:
