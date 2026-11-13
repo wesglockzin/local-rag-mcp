@@ -35,12 +35,17 @@ jobs:
       - name: tests (embedder stubbed — no Ollama in CI; real chromadb + mcp installed)
         run: python -m pytest -q
       - name: dependency audit
-        # These four chromadb advisories have no fixed release as of 2026-11-13.
-        # They affect the chroma server, auth and tenant features, none of which
-        # this project uses: it uses only the embedded PersistentClient with
-        # explicit embeddings. Remove each ID once chromadb ships a fix.
+        # Accepted by the owner (decision on DEP-2): four chromadb advisories
+        # with no fixed release. They concern Chroma's network server, which
+        # this tool never runs or connects to: it uses only PersistentClient
+        # on a local folder. tests/test_no_chroma_server.py guards this.
+        # Remove these ignores when a fixed chromadb release exists.
         run: >-
           pip-audit .
+          --ignore-vuln GHSA-2wm9-hf6c-p5cr
+          --ignore-vuln GHSA-36p7-vc44-83pf
+          --ignore-vuln GHSA-f4j7-r4q5-qw2c
+          --ignore-vuln GHSA-xph7-9rjv-w5fr
           --ignore-vuln PYSEC-2026-311
           --ignore-vuln PYSEC-2026-3813
           --ignore-vuln PYSEC-2026-3814

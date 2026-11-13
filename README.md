@@ -148,6 +148,14 @@ and oversize-split behavior.
 - One store, one collection — multi-corpus routing is out of scope here.
 - No hybrid keyword+vector stage; paraphrase headroom is measured and
   documented in the companion repo.
+- **Chroma advisories (accepted):** the tool uses Chroma only as a local
+  file store through `PersistentClient`. It never starts or connects to a
+  Chroma server. Four open chromadb advisories (GHSA-2wm9-hf6c-p5cr,
+  GHSA-36p7-vc44-83pf, GHSA-f4j7-r4q5-qw2c, GHSA-xph7-9rjv-w5fr, also
+  PYSEC-2026-311, PYSEC-2026-3813, PYSEC-2026-3814, PYSEC-2026-3815) concern
+  that server and have no fixed release. They are therefore accepted until
+  a fixed release exists. A test fails if the code ever uses a Chroma
+  server.
 
 ## License
 
