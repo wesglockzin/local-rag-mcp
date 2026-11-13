@@ -58,7 +58,9 @@ def get_collection():
         # existing empty directory, which would make a "read-only" server a
         # writer. Require the database file itself, not just the directory.
         if not os.path.isfile(os.path.join(STORE_DIR, "chroma.sqlite3")):
-            raise FileNotFoundError(f"store missing: {STORE_DIR} — run local-rag-ingest first")
+            raise FileNotFoundError(
+                f"store missing: {STORE_DIR} — run local-rag-ingest first"
+            )
         import chromadb
         from chromadb.config import Settings
 
@@ -88,7 +90,11 @@ def do_search(query: str, k: int = 4) -> dict:
     try:
         col = get_collection()
         if col.count() == 0:
-            return {"query": q, "results": [], "note": "index is empty — run local-rag-ingest"}
+            return {
+                "query": q,
+                "results": [],
+                "note": "index is empty — run local-rag-ingest",
+            }
         # PRE-FILTER: retired docs are excluded by lifecycle metadata BEFORE
         # the knn search — a `where` clause narrows eligible ids first, so
         # this does not suffer the recall loss of post-filtering. Ingest
